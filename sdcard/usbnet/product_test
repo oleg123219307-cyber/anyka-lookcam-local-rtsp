@@ -1,0 +1,111 @@
+#!/bin/sh
+
+LOG=/mnt/log/sd_rtsp_v23.log
+RTSP_BIN=/mnt/shm_rtsp
+RTSP_LOG=/mnt/log/shm_rtsp.log
+PIDFILE=/var/run/shm_rtsp.pid
+
+mkdir -p /mnt/log /var/run
+export PATH=/mnt/bin:/bin:/sbin:/usr/bin:/usr/sbin
+export LD_LIBRARY_PATH=/usr/lib:/lib:/mnt/lib
+
+log() {
+  echo "$(date 2>/dev/null) $*" >> "$LOG"
+}
+
+port_listening() {
+  netstat -ltn 2>/dev/null | grep -q ':554'
+}
+
+rtsp_running() {
+  ps | grep -q '[s]hm_rtsp' && port_listening
+}
+
+start_debug_services() {
+  log "start debug services"
+  if ! netstat -ltn 2>/dev/null | grep -q ':2323'; then
+    telnetd -l /bin/sh -p 2323 >> "$LOG" 2>&1 &
+  fi
+  if ! netstat -ltn 2>/dev/null | grep -q ':23'; then
+    telnetd >> "$LOG" 2>&1 &
+  fi
+  if ! netstat -ltn 2>/dev/null | grep -q ':2121'; then
+    tcpsvd 0 2121 ftpd -w / -t 600 >> "$LOG" 2>&1 &
+  fi
+}
+
+start_wifi_if_needed() {
+  if [ -x /usr/sbin/wifi_driver.sh ]; then
+    log "ensure wifi driver"
+    /usr/sbin/wifi_driver.sh install >> "$LOG" 2>&1
+    /usr/sbin/wifi_driver.sh sta >> "$LOG" 2>&1 &
+  fi
+}
+
+start_stock_app_if_needed() {
+  if ! ps | grep -q '[a]nyka_ipc'; then
+    log "start anyka_ipc"
+    /usr/bin/anyka_ipc >> /mnt/log/anyka_ipc-sd.log 2>&1 &
+  else
+    log "anyka_ipc already running"
+  fi
+}
+
+wait_for_h264_shm() {
+  i=0
+  while [ $i -lt 90 ]; do
+    if cat /proc/sysvipc/shm 2>/dev/null | grep -q '1048628'; then
+      log "h264 shared memory ready"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  log "h264 shared memory timeout"
+  return 1
+}
+
+start_rtsp() {
+  if [ ! -x "$RTSP_BIN" ]; then
+    log "missing or non-executable $RTSP_BIN"
+    return 1
+  fi
+  if rtsp_running; then
+    return 0
+  fi
+  log "restart shm_rtsp"
+  killall shm_rtsp >> "$LOG" 2>&1
+  "$RTSP_BIN" >> "$RTSP_LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 2
+  if rtsp_running; then
+    log "shm_rtsp listening on 554"
+    return 0
+  fi
+  log "shm_rtsp did not start cleanly"
+  return 1
+}
+
+watchdog_loop() {
+  wait_for_h264_shm
+  start_rtsp
+  while :; do
+    if ! rtsp_running; then
+      start_stock_app_if_needed
+      wait_for_h264_shm
+      start_rtsp
+    fi
+    sleep 15
+  done
+}
+
+log "=== sd rtsp v23 boot ==="
+uname -a >> "$LOG" 2>&1
+start_debug_services
+start_wifi_if_needed
+sleep 10
+start_stock_app_if_needed
+
+watchdog_loop >> "$LOG" 2>&1 &
+log "watchdog started pid=$!"
+log "=== product_test exit ==="
